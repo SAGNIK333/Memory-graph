@@ -1,0 +1,12 @@
+{
+  "display_name": "RP Memory Graph",
+  "loading_order": 20,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Rachit",
+  "version": "0.1.0",
+  "homePage": "",
+  "generate_interceptor": "rpGraphIntercept"
+}
