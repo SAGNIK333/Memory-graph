@@ -14,12 +14,13 @@ const DEFAULTS = {
   embedModel: 'bge-m3',
   embedKey: '',
   vecFloor: 0.35,
-  maxTokens: 2000,
-  chunkChars: 20000,
+  maxTokens: 4000,
+  chunkChars: 12000,
 };
 
 let busy = false;
 let lastInjected = '';
+let lastRaw = '';
 const vecCache = new Map();
 
 const ctxNow = () => SillyTavern.getContext();
@@ -132,10 +133,24 @@ async function summarize(rebuild = false) {
     for (let i = 0; i < chunks.length; i++) {
       setStatus(`Updating graph… part ${i + 1}/${chunks.length}`);
       const { system, prompt } = buildExtractionPrompt(g, chunks[i], ctx.name1, ctx.name2);
-      const reply = await callLLM(system, prompt);
-      const json = extractJson(reply);
-      if (!json) throw new Error('Model did not return valid JSON. Try again or raise max tokens.');
+      let reply = await callLLM(system, prompt);
+      let json = extractJson(reply);
+      if (!json) {
+        // one retry with a stricter instruction
+        reply = await callLLM(system, prompt + '\n\nIMPORTANT: respond with the JSON object only. No thinking, no explanation, no code fences.');
+        json = extractJson(reply);
+      }
+      lastRaw = String(reply ?? '');
+      $('#rpg_raw').val(lastRaw);
+      console.log('[RP Memory Graph] raw model reply:', reply);
+      if (!json) {
+        const preview = lastRaw.trim().slice(0, 160) || '(empty reply)';
+        throw new Error(`Model did not return usable JSON. Reply started with: ${preview}`);
+      }
       const st = mergeUpdate(g, json);
+      if (!st.added && !st.updated && !st.edges) {
+        toastr.warning('Model returned valid JSON but no new nodes or edges for this part.', 'RP Memory Graph');
+      }
       total.added += st.added; total.updated += st.updated; total.edges += st.edges;
     }
     g.lastIndex = ctx.chat.length;
@@ -249,6 +264,8 @@ function mountUI() {
       <div class="rpg-status" id="rpg_status"></div>
       <label>Last injected block</label>
       <textarea id="rpg_inject" class="rpg-inject text_pole" readonly></textarea>
+      <label>Last raw model reply (for debugging summaries)</label>
+      <textarea id="rpg_raw" class="rpg-inject text_pole" readonly></textarea>
     </div>
   </div>`;
   $('#extensions_settings2').append($('<div class="rpg-settings"></div>').html(html));
