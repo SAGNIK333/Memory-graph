@@ -1,4 +1,5 @@
-import { norm, emptyGraph, ensureShape, extractJson, mergeUpdate, retrieve, formatBlock, buildExtractionPrompt, layout } from './core.js';
+import { emptyGraph, ensureShape, extractJson, mergeUpdate, retrieve, formatBlock, buildExtractionPrompt } from './core.js';
+import { openViewer } from './viewer.js';
 
 const MODULE = 'rp_memory_graph';
 const KEY = 'rp_memory_graph_inject';
@@ -165,56 +166,8 @@ async function summarize(rebuild = false) {
   }
 }
 
-// ---------- viewer / editor ----------
-const hue = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
-const escHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-
-function drawGraph(g) {
-  const W = 640, H = 420;
-  const pos = layout(g.nodes, g.edges, W, H);
-  let svg = `<svg class="rpg-svg" viewBox="0 0 ${W} ${H}">`;
-  for (const e of g.edges) {
-    const a = pos.get(e.from), b = pos.get(e.to);
-    if (!a || !b) continue;
-    svg += `<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="currentColor" stroke-opacity="0.35"/>`;
-    svg += `<text class="rpg-edge-label" x="${(a.x + b.x) / 2}" y="${(a.y + b.y) / 2}" text-anchor="middle">${escHtml(e.relation.slice(0, 28))}</text>`;
-  }
-  for (const n of g.nodes) {
-    const p = pos.get(n.id);
-    svg += `<circle cx="${p.x}" cy="${p.y}" r="8" fill="hsl(${hue(n.type)},65%,55%)"><title>${escHtml(n.text || n.name)}</title></circle>`;
-    svg += `<text x="${p.x}" y="${p.y - 12}" text-anchor="middle">${escHtml(n.name.slice(0, 22))}</text>`;
-  }
-  return svg + '</svg>';
-}
-
-function openViewer() {
-  const g = G();
-  const $ov = $(`<div class="rpg-overlay"><div class="rpg-modal">
-    <h3>Memory graph: ${g.nodes.length} nodes, ${g.edges.length} edges</h3>
-    <div class="rpg-graph"></div>
-    <div class="rpg-status">Edit the JSON below to fix, merge, or delete nodes and edges (edges use node ids), then Save.</div>
-    <textarea class="rpg-json text_pole" spellcheck="false"></textarea>
-    <div class="rpg-btns"><div class="menu_button rpg-close">Close</div><div class="menu_button rpg-save">Save changes</div></div>
-  </div></div>`);
-  $ov.find('.rpg-graph').html(drawGraph(g));
-  $ov.find('.rpg-json').val(JSON.stringify({ nodes: g.nodes, edges: g.edges }, null, 2));
-  $ov.find('.rpg-close').on('click', () => $ov.remove());
-  $ov.on('click', (e) => { if (e.target === $ov[0]) $ov.remove(); });
-  $ov.find('.rpg-save').on('click', () => {
-    try {
-      const j = JSON.parse($ov.find('.rpg-json').val());
-      if (!Array.isArray(j.nodes) || !Array.isArray(j.edges)) throw new Error('Need "nodes" and "edges" arrays.');
-      g.nodes = j.nodes;
-      g.edges = j.edges.filter((e) => g.nodes.some((n) => n.id === e.from) && g.nodes.some((n) => n.id === e.to));
-      saveGraph();
-      refreshUI();
-      toastr.success('Graph saved.');
-      $ov.remove();
-    } catch (e) {
-      toastr.error(String(e.message || e), 'Invalid JSON');
-    }
-  });
-  $('body').append($ov);
+function openGraphViewer() {
+  openViewer({ getGraph: G, save: saveGraph, onChange: refreshUI });
 }
 
 // ---------- settings UI ----------
@@ -282,7 +235,7 @@ function mountUI() {
   bind('rpg_maxTokens', 'maxTokens', 'num');
   $('#rpg_summarize').on('click', () => summarize(false));
   $('#rpg_rebuild').on('click', () => summarize(true));
-  $('#rpg_view').on('click', openViewer);
+  $('#rpg_view').on('click', openGraphViewer);
   $('#rpg_clear').on('click', () => {
     if (!confirm('Delete the whole memory graph for this chat?')) return;
     const g = G(); g.nodes = []; g.edges = []; g.lastIndex = 0;

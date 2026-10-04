@@ -61,15 +61,47 @@ function ensureNode(g, name, now) {
 }
 
 // Pull the first JSON object out of a model reply (handles code fences, chatter, trailing commas).
+// Close a reply that was cut off mid-JSON: drop the unfinished tail, close open brackets.
+function repairTruncated(t) {
+  const stack = [];
+  let inStr = false, esc = false, lastGood = -1, goodStack = [];
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') stack.push(c);
+    else if (c === '}' || c === ']') {
+      stack.pop();
+      if (stack.length >= 1) { lastGood = i; goodStack = [...stack]; }
+    }
+  }
+  if (lastGood < 0) return null;
+  const closers = goodStack.reverse().map((c) => (c === '{' ? '}' : ']')).join('');
+  return t.slice(0, lastGood + 1).replace(/,\s*$/, '') + closers;
+}
+
 export function extractJson(text) {
   if (!text) return null;
-  let t = String(text).replace(/```(?:json)?/gi, '');
+  let t = String(text)
+    .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '')
+    .replace(/```(?:json)?/gi, '');
   const a = t.indexOf('{');
+  if (a < 0) return null;
+  t = t.slice(a);
   const b = t.lastIndexOf('}');
-  if (a < 0 || b <= a) return null;
-  t = t.slice(a, b + 1);
-  try { return JSON.parse(t); } catch { /* try repair */ }
-  try { return JSON.parse(t.replace(/,\s*([}\]])/g, '$1')); } catch { return null; }
+  const whole = b > 0 ? t.slice(0, b + 1) : t;
+  try { return JSON.parse(whole); } catch { /* try repairs */ }
+  try { return JSON.parse(whole.replace(/,\s*([}\]])/g, '$1')); } catch { /* truncated? */ }
+  const fixed = repairTruncated(t);
+  if (fixed) {
+    try { return JSON.parse(fixed.replace(/,\s*([}\]])/g, '$1')); } catch { /* give up */ }
+  }
+  return null;
 }
 
 export function mergeUpdate(g, upd, now = Date.now()) {
@@ -237,3 +269,60 @@ export function layout(nodes, edges, w = 640, h = 420, iters = 250) {
   }
   return pos;
 }
+
+// Better layout for the viewer. Nodes that already have x/y keep them (when keep=true),
+// so manual arrangement survives and new nodes settle around the old ones.
+export function layoutGraph(nodes, edges, { iters, keep = true } = {}) {
+  const n = nodes.length;
+  if (!n) return;
+  const size = Math.max(700, Math.sqrt(n) * 260);
+  const k = Math.sqrt((size * size) / n) * 0.9;
+  const steps = iters || (n > 300 ? 120 : 300);
+  const idx = new Map(nodes.map((nd, i) => [nd.id, i]));
+  const P = nodes.map((nd, i) => {
+    if (keep && Number.isFinite(nd.x) && Number.isFinite(nd.y)) return { x: nd.x, y: nd.y, fixed: true, dx: 0, dy: 0 };
+    const a = i * 2.399963;
+    const r = k * 0.6 * Math.sqrt(i + 1);
+    return { x: size / 2 + Math.cos(a) * r, y: size / 2 + Math.sin(a) * r, fixed: false, dx: 0, dy: 0 };
+  });
+  if (P.every((p) => p.fixed)) return;
+  const E = edges
+    .map((e) => [idx.get(e.from), idx.get(e.to)])
+    .filter(([a, b]) => a !== undefined && b !== undefined && a !== b);
+  for (let it = 0; it < steps; it++) {
+    const t = (1 - it / steps) * k * 0.6 + 0.5;
+    for (const p of P) { p.dx = 0; p.dy = 0; }
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        let dx = P[i].x - P[j].x, dy = P[i].y - P[j].y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = dx * dx + dy * dy + 0.01; }
+        const d = Math.sqrt(d2);
+        const f = (k * k) / d;
+        dx /= d; dy /= d;
+        P[i].dx += dx * f; P[i].dy += dy * f;
+        P[j].dx -= dx * f; P[j].dy -= dy * f;
+      }
+    }
+    for (const [a, b] of E) {
+      let dx = P[a].x - P[b].x, dy = P[a].y - P[b].y;
+      const d = Math.max(0.01, Math.hypot(dx, dy));
+      const f = (d * d) / k;
+      dx /= d; dy /= d;
+      P[a].dx -= dx * f; P[a].dy -= dy * f;
+      P[b].dx += dx * f; P[b].dy += dy * f;
+    }
+    for (const p of P) {
+      if (p.fixed) continue;
+      p.dx += (size / 2 - p.x) * 0.25;
+      p.dy += (size / 2 - p.y) * 0.25;
+      const d = Math.max(0.01, Math.hypot(p.dx, p.dy));
+      const m = Math.min(d, t);
+      p.x = clampN(p.x + (p.dx / d) * m, 0, size);   // keep stray nodes inside the box
+      p.y = clampN(p.y + (p.dy / d) * m, 0, size);
+    }
+  }
+  nodes.forEach((nd, i) => { nd.x = Math.round(P[i].x); nd.y = Math.round(P[i].y); });
+}
+
+function clampN(x, a, b) { return Math.min(b, Math.max(a, x)); }
