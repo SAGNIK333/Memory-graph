@@ -28,10 +28,32 @@ export function ensureShape(g) {
   return g;
 }
 
+// Comparison key: lowercase, no leading article, no "(parenthetical)", no trailing possessive.
+export function nameKey(s) {
+  const k = norm(String(s || '').replace(/\([^)]*\)/g, ' '))
+    .replace(/^(?:the|a|an)\s+/, '')
+    .replace(/'s$/, '')
+    .replace(/s'$/, 's')
+    .trim();
+  return k || norm(s);
+}
+const parenOf = (s) => norm((String(s || '').match(/\(([^)]*)\)/) || [])[1] || '');
+// Same key, and parentheticals do not contradict each other ("Bar (Mondstadt)" vs "Bar (Liyue)" stay distinct).
+const sameName = (a, b) => {
+  const ka = nameKey(a);
+  if (!ka || ka !== nameKey(b)) return false;
+  const pa = parenOf(a), pb = parenOf(b);
+  return !pa || !pb || pa === pb;
+};
+
 export function findNode(g, name) {
   const n = norm(name);
   if (!n) return undefined;
-  return g.nodes.find((x) => norm(x.name) === n || (x.aliases || []).some((a) => norm(a) === n));
+  const exact = g.nodes.find((x) => norm(x.name) === n || (x.aliases || []).some((a) => norm(a) === n));
+  if (exact) return exact;
+  // Fuzzy stage: only accept an unambiguous match. Two candidates means we cannot tell, so treat it as new.
+  const cands = g.nodes.filter((x) => sameName(x.name, name) || (x.aliases || []).some((a) => sameName(a, name)));
+  return cands.length === 1 ? cands[0] : undefined;
 }
 
 function uniqAliases(arr, selfName) {
@@ -85,7 +107,7 @@ function repairTruncated(t) {
   return t.slice(0, lastGood + 1).replace(/,\s*$/, '') + closers;
 }
 
-export function extractJson(text) {
+export function extractJson(text, info = {}) {
   if (!text) return null;
   let t = String(text)
     .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '')
@@ -99,7 +121,11 @@ export function extractJson(text) {
   try { return JSON.parse(whole.replace(/,\s*([}\]])/g, '$1')); } catch { /* truncated? */ }
   const fixed = repairTruncated(t);
   if (fixed) {
-    try { return JSON.parse(fixed.replace(/,\s*([}\]])/g, '$1')); } catch { /* give up */ }
+    try {
+      const v = JSON.parse(fixed.replace(/,\s*([}\]])/g, '$1'));
+      info.repaired = true;   // reply was cut off; only the complete entries were recovered
+      return v;
+    } catch { /* give up */ }
   }
   return null;
 }
@@ -115,7 +141,7 @@ export function mergeUpdate(g, upd, now = Date.now()) {
     if (ex) {
       if (typeof n.text === 'string' && n.text.trim()) ex.text = n.text.trim();
       if (n.type) ex.type = String(n.type);
-      ex.aliases = uniqAliases([...(ex.aliases || []), ...aliases], ex.name);
+      ex.aliases = uniqAliases([...(ex.aliases || []), ...aliases, n.name], ex.name);
       ex.updatedAt = now;
       stats.updated++;
     } else {
@@ -152,10 +178,8 @@ export function cosine(a, b) {
 
 function lexScore(n, qn, qt) {
   const names = [n.name, ...(n.aliases || [])];
-  const nameHit = names.some((x) => {
-    const xn = norm(x);
-    return xn.length >= 3 && new RegExp(`(^|\\s)${esc(xn)}(?:s|es)?(?=\\s|$)`).test(qn);
-  });
+  const nameHit = names.some((x) => [norm(x), nameKey(x)].some((xn) =>
+    xn.length >= 3 && new RegExp(`(^|\\s)${esc(xn)}(?:s|es)?(?=\\s|$)`).test(qn)));
   const nt = new Set(tokens(`${n.name} ${n.text}`));
   let inter = 0;
   for (const w of qt) if (nt.has(w)) inter++;
@@ -198,23 +222,66 @@ export function formatBlock(g, res) {
   return lines.join('\n');
 }
 
+// Nodes whose name or alias appears in the text, most-mentioned first.
+export function relevantNodes(g, text, max = 14) {
+  const qn = norm(text);
+  const out = [];
+  for (const n of g.nodes) {
+    let hits = 0;
+    const pats = new Set();
+    for (const nm of [n.name, ...(n.aliases || [])]) {
+      for (const k of [norm(nm), nameKey(nm)]) if (k.length >= 3) pats.add(k);
+    }
+    for (const k of pats) {
+      const m = qn.match(new RegExp(`(^|\\s)${esc(k)}(?:s|es)?(?=\\s|$)`, 'g'));
+      if (m) hits += m.length;
+    }
+    if (hits) out.push({ n, hits });
+  }
+  out.sort((a, b) => b.hits - a.hits);
+  return out.slice(0, max).map((x) => x.n);
+}
+
+// Split [{idx, line}] into parts of at most `limit` characters. A single huge message gets its own part.
+export function chunkItems(items, limit) {
+  const chunks = [];
+  let cur = [], len = 0;
+  for (const it of items) {
+    const l = it.line.length + 2;
+    if (cur.length && len + l > limit) { chunks.push(cur); cur = []; len = 0; }
+    cur.push(it); len += l;
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
 export function buildExtractionPrompt(g, transcript, userName, charName) {
-  const existing = g.nodes.length
-    ? g.nodes.map((n) => `- ${n.name} (${n.type}): ${(n.text || '').slice(0, 220)}`).join('\n')
-    : '(none yet)';
+  const rel = relevantNodes(g, transcript, 14);
+  const relIds = new Set(rel.map((n) => n.id));
+  const others = g.nodes
+    .filter((n) => !relIds.has(n.id))
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+    .slice(0, 400);
+  const full = rel.length
+    ? rel.map((n) => `- ${n.name} (${n.type})${n.aliases && n.aliases.length ? ` [aliases: ${n.aliases.join(', ')}]` : ''}: ${n.text || '(no details yet)'}`).join('\n')
+    : '(none)';
+  const known = others.length ? others.map((n) => `${n.name} (${n.type})`).join('; ') : '(none)';
   const system =
-    'You maintain a knowledge graph for a long-running roleplay. Read the new transcript and output ONLY a JSON object, no commentary.';
+    'You maintain a knowledge graph for a long-running roleplay. Read the new transcript and output ONLY a JSON object, no commentary. Do not deliberate at length: this is extraction, not analysis.';
   const prompt = `Update the story knowledge graph using the NEW TRANSCRIPT below.
 
 Main participants: ${userName || 'User'} and ${charName || 'Character'}.
 
-EXISTING NODES (reuse these exact names when the same entity appears; do not create duplicates):
-${existing}
+NODES ALREADY IN THE GRAPH THAT APPEAR IN THIS TRANSCRIPT (current full text):
+${full}
+
+OTHER NODES ALREADY IN THE GRAPH (names only):
+${known}
 
 RULES
 - Nodes are named entities worth remembering: characters, places, objects, factions, events, promises, secrets, open plot threads.
-- "text" must be a self-contained 1-3 sentence description that makes sense without the transcript (who/what/where/when, why it matters, current state). When updating an existing node, return its FULL revised text, merging old facts with new ones.
-- "aliases" are other names or nicknames used in the story.
+- If an entity is already in the graph (under any name or alias), use its EXACT existing name. Never create a second node for the same thing. Put new nicknames in "aliases".
+- "text" must be a self-contained 1-3 sentence description that makes sense without the transcript (who/what/where/when, why it matters, current state). When updating an existing node, return its FULL revised text: keep the still-true facts from the current text and add or change what happened.
 - Edges link two nodes. "relation" is a short phrase (e.g. "gave a flower to", "distrusts", "located in"). Set "replace": true on an edge when the relationship between that pair has changed and old edges between them are now outdated.
 - Only include nodes that are new or changed. Skip trivia. Do not invent facts.
 
