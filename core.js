@@ -393,3 +393,107 @@ export function layoutGraph(nodes, edges, { iters, keep = true } = {}) {
 }
 
 function clampN(x, a, b) { return Math.min(b, Math.max(a, x)); }
+
+// Wraps the extraction prompt with the user's preset (system side) and reminder (after the transcript).
+export function composeRequest(g, transcript, userName, charName, { preset = '', reminder = '' } = {}) {
+  const base = buildExtractionPrompt(g, transcript, userName, charName);
+  const system = [String(preset || '').trim(), base.system].filter(Boolean).join('\n\n');
+  const rem = String(reminder || '').trim();
+  const prompt = rem ? `${base.prompt}\n\n${rem}` : base.prompt;
+  return { system, prompt };
+}
+
+// Best x for each item in order, at least `gap` apart, as close to its desired x as possible.
+function spreadRow(des, gap) {
+  const blocks = [];
+  des.forEach((d, i) => {
+    blocks.push({ sum: d - i * gap, cnt: 1 });
+    while (blocks.length > 1) {
+      const b = blocks[blocks.length - 1], a = blocks[blocks.length - 2];
+      if (a.sum / a.cnt <= b.sum / b.cnt) break;
+      a.sum += b.sum; a.cnt += b.cnt; blocks.pop();
+    }
+  });
+  const xs = [];
+  let i = 0;
+  for (const b of blocks) {
+    const v = b.sum / b.cnt;
+    for (let k = 0; k < b.cnt; k++, i++) xs.push(v + i * gap);
+  }
+  return xs;
+}
+
+// Chronological tree: the first node is at the top and every update (summary batch) gets its own rows
+// below the previous one, so new nodes always appear lower down. Inside an update, a node sits one row
+// under the earlier node it links to, and each row is arranged to stay close to those parents.
+export function treeLayout(nodes, edges, { gapX = 170, gapY = 96, batchGap = 56, maxPerRow = 9 } = {}) {
+  const pos = new Map();
+  const rows = [];
+  const batches = [];
+  if (!nodes.length) return { pos, rows, batches };
+
+  const order = nodes.map((nd, i) => ({ nd, i }))
+    .sort((a, b) => ((a.nd.createdAt || 0) - (b.nd.createdAt || 0)) || (a.i - b.i))
+    .map((x) => x.nd);
+  const rank = new Map(order.map((nd, i) => [nd.id, i]));
+  const adj = new Map(order.map((nd) => [nd.id, []]));
+  for (const e of edges) {
+    if (e.from !== e.to && adj.has(e.from) && adj.has(e.to)) { adj.get(e.from).push(e.to); adj.get(e.to).push(e.from); }
+  }
+
+  const groups = [];
+  const batchOf = new Map();
+  let lastT;
+  for (const nd of order) {
+    const t = nd.createdAt || 0;
+    if (!groups.length || t !== lastT) { groups.push([]); lastT = t; }
+    groups[groups.length - 1].push(nd);
+    batchOf.set(nd.id, groups.length - 1);
+  }
+
+  const parentOf = (nd) => {
+    let best = null;
+    for (const id of adj.get(nd.id)) if (rank.get(id) < rank.get(nd.id) && (best === null || rank.get(id) < rank.get(best))) best = id;
+    return best;
+  };
+
+  let y = 0;
+  groups.forEach((members, b) => {
+    const depth = new Map();
+    let maxD = 0;
+    for (const nd of members) {
+      const p = parentOf(nd);
+      const d = p !== null && batchOf.get(p) === b ? depth.get(p) + 1 : 0;
+      depth.set(nd.id, d);
+      if (d > maxD) maxD = d;
+    }
+    let top = null, bottom = null;
+    for (let d = 0; d <= maxD; d++) {
+      const level = members.filter((nd) => depth.get(nd.id) === d);
+      if (!level.length) continue;
+      const want = level.map((nd) => {
+        const xs = adj.get(nd.id).filter((id) => pos.has(id)).map((id) => pos.get(id).x);
+        return { nd, x: xs.length ? xs.reduce((s, v) => s + v, 0) / xs.length : null };
+      });
+      const known = want.filter((w) => w.x !== null).map((w) => w.x);
+      const fill = known.length ? known.reduce((s, v) => s + v, 0) / known.length : 0;
+      want.forEach((w) => { if (w.x === null) w.x = fill; });
+      want.sort((a, c) => a.x - c.x);
+      // too many for one row: deal them out round-robin so every row spans the same width
+      const nRows = Math.ceil(want.length / maxPerRow);
+      const lanes = Array.from({ length: nRows }, () => []);
+      want.forEach((w, i) => lanes[i % nRows].push(w));
+      for (const lane of lanes) {
+        if (rows.length) y += (top === null && bottom === null ? batchGap : 0) + gapY;
+        else y = 0;
+        const xs = spreadRow(lane.map((w) => w.x), gapX);
+        lane.forEach((w, i) => pos.set(w.nd.id, { x: Math.round(xs[i]), y }));
+        rows.push({ y, batch: b });
+        if (top === null) top = y;
+        bottom = y;
+      }
+    }
+    batches.push({ index: b, top, bottom, count: members.length, createdAt: members[0].createdAt || 0 });
+  });
+  return { pos, rows, batches };
+}

@@ -11,6 +11,16 @@ Install from the GitHub link in SillyTavern (Extensions -> Install extension). T
 - **View / edit graph** opens a map. Tap a node to edit it.
 - **Last injected block** shows exactly what was sent; **Last raw model reply** shows what the summarizer got back.
 
+## Preset, reminder and previewing what is sent
+- **Summary preset** is text placed at the very start of every summary request (system message). Use it to tell the model the chat is fiction and that romantic or mature scenes must be summarized neutrally in the JSON format. Press *Insert example preset* for a starting point.
+- **Reminder after the chat** is repeated after the chat history, where models pay the most attention.
+- **Preview request** shows exactly what the next Summarize will send (preset, graph context, chat messages, split into parts) without sending anything. Tick **Review what gets sent before each summary** to get that window every time, with Cancel / Send.
+- **Last request sent** in the settings shows the most recent request that actually went out.
+- The status line reads "X of Y messages summarized · Z waiting" and updates after every part, including failed runs.
+
+## Graph view
+Default **Tree** layout: the first node is at the top and each summary adds its nodes in a new band below, labelled "Update N", so the story reads top to bottom. **Latest** jumps to the newest nodes (ringed). **Layout: Free** switches to the draggable map.
+
 ## How summaries stay reliable
 - **Progress is saved after every part.** If something fails, finished parts stay saved and **Summarize now** resumes from where it stopped. Old messages are never sent again.
 - **Retry, then split.** A failing part is retried once with a stricter instruction, then split in half and each half tried. A cut-off reply is never trusted unless nothing else works.

@@ -1,5 +1,6 @@
 // Full-screen graph viewer/editor. Canvas-rendered so it stays smooth with hundreds of nodes.
-import { layoutGraph, norm } from './core.js';
+// Two layouts: "Tree" (chronological, top to bottom, one band per summary update) and "Free" (draggable).
+import { layoutGraph, treeLayout, norm } from './core.js';
 
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -13,16 +14,20 @@ const hue = (t) => {
 };
 const color = (t, l = 62) => `hsl(${hue(t)} 72% ${l}%)`;
 const trunc = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+const when = (t) => {
+  if (!t) return '';
+  try {
+    const d = new Date(t);
+    return `${d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} ${d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
+  } catch { return ''; }
+};
 
 export function openViewer({ getGraph, save, onChange }) {
   if (document.querySelector('.rpg-ov')) return;
   const g = getGraph();
 
-  if (g.nodes.some((n) => !Number.isFinite(n.x) || !Number.isFinite(n.y))) {
-    layoutGraph(g.nodes, g.edges, { keep: true });
-    save();
-  }
-
+  let mode = g.view === 'free' ? 'free' : 'tree';
+  let tree = null;
   let sel = null;               // selected node id
   let matches = null;           // Set of ids matching the search box
   let byId = new Map();
@@ -30,6 +35,16 @@ export function openViewer({ getGraph, save, onChange }) {
   let curConns = [];
   const view = { x: 0, y: 0, k: 1 };
   let cssW = 1, cssH = 1, dpr = 1, raf = 0, anim = 0;
+
+  // node position in the current layout
+  const P = (n) => (mode === 'tree' ? (tree && tree.pos.get(n.id)) || { x: 0, y: 0 } : n);
+
+  function ensureFree() {
+    if (g.nodes.some((n) => !Number.isFinite(n.x) || !Number.isFinite(n.y))) {
+      layoutGraph(g.nodes, g.edges, { keep: true });
+      save();
+    }
+  }
 
   const root = document.createElement('div');
   root.className = 'rpg-ov';
@@ -41,7 +56,9 @@ export function openViewer({ getGraph, save, onChange }) {
         <button class="rpg-btn" data-a="zoom-out" title="Zoom out">−</button>
         <button class="rpg-btn" data-a="zoom-in" title="Zoom in">+</button>
         <button class="rpg-btn" data-a="fit">Fit</button>
-        <button class="rpg-btn" data-a="relayout" title="Recompute the layout">Re-layout</button>
+        <button class="rpg-btn" data-a="latest" title="Jump to the newest nodes">Latest</button>
+        <button class="rpg-btn" data-a="mode" title="Switch between tree and free layout"></button>
+        <button class="rpg-btn" data-a="relayout" title="Recompute the free layout">Re-layout</button>
         <button class="rpg-btn" data-a="add">+ Node</button>
         <button class="rpg-btn rpg-close" data-a="close" title="Close">✕</button>
       </div>
@@ -50,7 +67,7 @@ export function openViewer({ getGraph, save, onChange }) {
       <div class="rpg-stage">
         <canvas class="rpg-canvas"></canvas>
         <div class="rpg-legend"></div>
-        <div class="rpg-hint">Tap a node to edit · drag to pan · pinch or scroll to zoom</div>
+        <div class="rpg-hint"></div>
       </div>
       <aside class="rpg-panel" hidden></aside>
     </div>`;
@@ -70,17 +87,26 @@ export function openViewer({ getGraph, save, onChange }) {
       deg.set(e.from, (deg.get(e.from) || 0) + 1);
       deg.set(e.to, (deg.get(e.to) || 0) + 1);
     }
-    $('.rpg-count').textContent = `${g.nodes.length} nodes · ${g.edges.length} links`;
+    if (mode === 'tree') tree = treeLayout(g.nodes, g.edges);
+    $('.rpg-count').textContent = `${g.nodes.length} nodes · ${g.edges.length} links${mode === 'tree' && tree.batches.length ? ` · ${tree.batches.length} update${tree.batches.length === 1 ? '' : 's'}` : ''}`;
     const counts = new Map();
     for (const n of g.nodes) counts.set(n.type || 'thing', (counts.get(n.type || 'thing') || 0) + 1);
     $('.rpg-legend').innerHTML = [...counts]
       .sort((a, b) => b[1] - a[1])
       .map(([t, c]) => `<span><i style="background:${color(t)}"></i>${esc(t)} ${c}</span>`)
-      .join('');
+      .join('') + (mode === 'tree' && tree.batches.length > 1 ? '<span><i class="ring"></i>newest update</span>' : '');
   }
   const radius = (n) => (5 + Math.min(9, (deg.get(n.id) || 0) * 1.1)) * clamp(Math.sqrt(view.k), 0.6, 1.5);
-  const sx = (n) => view.x + n.x * view.k;
-  const sy = (n) => view.y + n.y * view.k;
+  const sx = (n) => view.x + P(n).x * view.k;
+  const sy = (n) => view.y + P(n).y * view.k;
+
+  function syncToolbar() {
+    $('[data-a=mode]').textContent = mode === 'tree' ? 'Layout: Tree' : 'Layout: Free';
+    $('[data-a=relayout]').style.display = mode === 'free' ? '' : 'none';
+    $('.rpg-hint').textContent = mode === 'tree'
+      ? 'Top to bottom = order of creation · tap a node to edit · drag to pan · pinch or scroll to zoom'
+      : 'Tap a node to edit · drag a node to move it · drag the background to pan · pinch or scroll to zoom';
+  }
 
   function commit(msg) {
     save();
@@ -96,6 +122,54 @@ export function openViewer({ getGraph, save, onChange }) {
     if (!raf) raf = requestAnimationFrame(draw);
   }
 
+  // control points for an edge; tree mode uses vertical-tangent curves, same-row links bulge upward
+  function edgeShape(ax, ay, bx, by) {
+    if (mode !== 'tree') return { c1: [ax, ay], c2: [bx, by], mid: [(ax + bx) / 2, (ay + by) / 2] };
+    if (Math.abs(ay - by) < 6) {
+      const h = Math.min(70, Math.abs(bx - ax) / 3 + 18) * Math.max(0.5, view.k);
+      return { c1: [ax, ay - h], c2: [bx, by - h], mid: [(ax + bx) / 2, ay - h * 0.75] };
+    }
+    const my = (ay + by) / 2;
+    return { c1: [ax, my], c2: [bx, my], mid: [(ax + bx) / 2, my] };
+  }
+  function strokeEdge(ax, ay, bx, by) {
+    const sh = edgeShape(ax, ay, bx, by);
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    if (mode === 'tree') ctx.bezierCurveTo(sh.c1[0], sh.c1[1], sh.c2[0], sh.c2[1], bx, by);
+    else ctx.lineTo(bx, by);
+    ctx.stroke();
+    return sh;
+  }
+
+  function drawBands() {
+    if (mode !== 'tree' || !tree || !tree.batches.length) return;
+    ctx.font = '600 11px system-ui, -apple-system, "Segoe UI", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    tree.batches.forEach((b, i) => {
+      const yTop = view.y + (b.top - 52) * view.k;
+      const yBot = view.y + (b.bottom + 46) * view.k;
+      if (yBot < 0 || yTop > cssH) return;
+      if (i > 0 && yTop >= 0 && yTop <= cssH) {
+        ctx.strokeStyle = 'rgba(140,150,185,.16)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([6, 6]);
+        ctx.beginPath(); ctx.moveTo(0, yTop); ctx.lineTo(cssW, yTop); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      const ly = clamp(yTop + 6, 6, Math.max(6, yBot - 30));   // label sticks to the top while its band is on screen
+      const label = `Update ${i + 1}`;
+      const sub = `${b.count} node${b.count === 1 ? '' : 's'}${b.createdAt ? ' · ' + when(b.createdAt) : ''}`;
+      ctx.fillStyle = 'rgba(160,175,225,.85)';
+      ctx.fillText(label, 12, ly);
+      ctx.font = '500 10px system-ui, sans-serif';
+      ctx.fillStyle = 'rgba(140,152,190,.7)';
+      ctx.fillText(sub, 12, ly + 14);
+      ctx.font = '600 11px system-ui, -apple-system, "Segoe UI", sans-serif';
+    });
+  }
+
   function draw() {
     raf = 0;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -103,6 +177,8 @@ export function openViewer({ getGraph, save, onChange }) {
     const gs = 32 * view.k;
     stage.style.backgroundSize = `${gs}px ${gs}px`;
     stage.style.backgroundPosition = `${view.x}px ${view.y}px`;
+
+    drawBands();
 
     const sn = sel ? byId.get(sel) : null;
     const nbr = new Set();
@@ -114,7 +190,7 @@ export function openViewer({ getGraph, save, onChange }) {
       }
     }
     const dim = (id) => (sn && !nbr.has(id)) || (matches && !matches.has(id));
-    const M = 40;
+    const M = 60;
     const on = (x, y) => x > -M && y > -M && x < cssW + M && y < cssH + M;
 
     // edges
@@ -123,20 +199,20 @@ export function openViewer({ getGraph, save, onChange }) {
       const a = byId.get(e.from), b = byId.get(e.to);
       if (!a || !b) continue;
       const ax = sx(a), ay = sy(a), bx = sx(b), by = sy(b);
-      if (!on(ax, ay) && !on(bx, by)) continue;
+      const inView = on(ax, ay) || on(bx, by) || (mode === 'tree' && Math.min(ay, by) < cssH && Math.max(ay, by) > 0);
+      if (!inView) continue;
       const hot = sn && (e.from === sn.id || e.to === sn.id);
       if (hot) { hotEdges.push([e, ax, ay, bx, by]); continue; }
       ctx.strokeStyle = sn || matches ? 'rgba(140,150,185,.10)' : 'rgba(140,150,185,.30)';
       ctx.lineWidth = 1.1;
-      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+      strokeEdge(ax, ay, bx, by);
     }
     ctx.strokeStyle = 'rgba(170,195,255,.95)';
     ctx.lineWidth = 2;
-    for (const [, ax, ay, bx, by] of hotEdges) {
-      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
-    }
+    const hotShapes = hotEdges.map(([e, ax, ay, bx, by]) => [e, strokeEdge(ax, ay, bx, by)]);
 
     // nodes
+    const newestAt = mode === 'tree' && tree && tree.batches.length > 1 ? tree.batches[tree.batches.length - 1].createdAt : null;
     const vis = [];
     for (const n of g.nodes) {
       const x = sx(n), y = sy(n);
@@ -144,6 +220,10 @@ export function openViewer({ getGraph, save, onChange }) {
       const r = radius(n);
       vis.push({ n, x, y, r });
       ctx.globalAlpha = dim(n.id) ? 0.28 : 1;
+      if (newestAt !== null && (n.createdAt || 0) === newestAt) {
+        ctx.beginPath(); ctx.arc(x, y, r + 5, 0, 6.2832);
+        ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(124,156,255,.6)'; ctx.stroke();
+      }
       ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832);
       ctx.fillStyle = color(n.type);
       ctx.fill();
@@ -177,15 +257,14 @@ export function openViewer({ getGraph, save, onChange }) {
     }
 
     // relation labels for the selected node's links
-    if (hotEdges.length && hotEdges.length <= 16) {
+    if (hotShapes.length && hotShapes.length <= 16) {
       ctx.font = '500 11px system-ui, sans-serif';
-      for (const [e, ax, ay, bx, by] of hotEdges) {
+      for (const [e, sh] of hotShapes) {
         const text = trunc(e.relation, 32);
-        const mx = (ax + bx) / 2, my = (ay + by) / 2;
         ctx.lineWidth = 3.5; ctx.strokeStyle = 'rgba(8,10,18,.92)';
-        ctx.strokeText(text, mx, my - 6);
+        ctx.strokeText(text, sh.mid[0], sh.mid[1] - 6);
         ctx.fillStyle = '#b9c8ff';
-        ctx.fillText(text, mx, my - 6);
+        ctx.fillText(text, sh.mid[0], sh.mid[1] - 6);
       }
     }
   }
@@ -214,14 +293,39 @@ export function openViewer({ getGraph, save, onChange }) {
     anim = requestAnimationFrame(step);
   }
 
-  function fit(animate = true) {
-    if (!g.nodes.length) { Object.assign(view, { x: cssW / 2, y: cssH / 2, k: 1 }); requestDraw(); return; }
+  function fitList(list, maxK, animate = true) {
+    if (!list.length) { Object.assign(view, { x: cssW / 2, y: cssH / 2, k: 1 }); requestDraw(); return; }
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (const n of g.nodes) { x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y); x1 = Math.max(x1, n.x); y1 = Math.max(y1, n.y); }
-    const pad = 70, bw = Math.max(1, x1 - x0), bh = Math.max(1, y1 - y0);
-    const k = clamp(Math.min((cssW - pad * 2) / bw, (cssH - pad * 2) / bh), 0.1, 1.4);
-    const t = { k, x: cssW / 2 - ((x0 + x1) / 2) * k, y: cssH / 2 - ((y0 + y1) / 2) * k };
+    for (const n of list) {
+      const p = P(n);
+      x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y);
+    }
+    const pad = 80, bw = Math.max(1, x1 - x0), bh = Math.max(1, y1 - y0);
+    let k = clamp(Math.min((cssW - pad * 2) / bw, (cssH - pad * 2) / bh), 0.1, maxK);
+    let t;
+    if (mode === 'tree' && list === g.nodes && k < 0.55) {
+      // a long story: stay readable and start at the first node; scroll/drag down (or press Latest) for the rest
+      k = clamp(Math.min(0.75, (cssW - 40) / bw), 0.4, 0.75);
+      let top = list[0];
+      for (const n of list) if (P(n).y < P(top).y) top = n;
+      const rootX = P(top).x;
+      t = { k, x: cssW / 2 - rootX * k, y: 70 - y0 * k };
+    } else {
+      t = { k, x: cssW / 2 - ((x0 + x1) / 2) * k, y: cssH / 2 - ((y0 + y1) / 2) * k };
+    }
     if (animate) animateTo(t); else { Object.assign(view, t); requestDraw(); }
+  }
+  const fit = (animate = true) => fitList(g.nodes, 1.4, animate);
+
+  function showLatest() {
+    let list;
+    if (mode === 'tree' && tree && tree.batches.length) {
+      const t = tree.batches[tree.batches.length - 1].createdAt;
+      list = g.nodes.filter((n) => (n.createdAt || 0) === t);
+    } else {
+      list = g.nodes.slice(-12);
+    }
+    fitList(list, 1.2);
   }
 
   function zoomAt(px, py, f) {
@@ -232,7 +336,8 @@ export function openViewer({ getGraph, save, onChange }) {
   }
 
   function focusNode(n, k = Math.max(view.k, 1)) {
-    animateTo({ k, x: cssW / 2 - n.x * k, y: cssH / 2 - n.y * k });
+    const p = P(n);
+    animateTo({ k, x: cssW / 2 - p.x * k, y: cssH / 2 - p.y * k });
   }
 
   // ---------- pointer interaction ----------
@@ -284,11 +389,11 @@ export function openViewer({ getGraph, save, onChange }) {
     if (!drag) return;
     if (!drag.moved && Math.hypot(px - drag.sx, py - drag.sy) > 5) drag.moved = true;
     if (!drag.moved) return;
-    if (drag.node) {
+    if (drag.node && mode === 'free') {
       drag.node.x += (px - drag.lx) / view.k;
       drag.node.y += (py - drag.ly) / view.k;
     } else {
-      view.x += px - drag.lx; view.y += py - drag.ly;
+      view.x += px - drag.lx; view.y += py - drag.ly;   // tree mode: dragging always pans
     }
     drag.lx = px; drag.ly = py;
     requestDraw();
@@ -300,7 +405,7 @@ export function openViewer({ getGraph, save, onChange }) {
     if (!drag || ptrs.size) return;
     const d = drag; drag = null;
     if (!d.moved) select(d.node ? d.node.id : null);
-    else if (d.node) save();
+    else if (d.node && mode === 'free') save();
   };
   canvas.addEventListener('pointerup', endPtr);
   canvas.addEventListener('pointercancel', endPtr);
@@ -391,6 +496,16 @@ export function openViewer({ getGraph, save, onChange }) {
   });
 
   // ---------- toolbar ----------
+  function setMode(m) {
+    mode = m;
+    g.view = m;
+    if (m === 'free') ensureFree();
+    save();
+    syncToolbar();
+    reindex();
+    fit(false);
+  }
+
   root.querySelector('.rpg-tools').addEventListener('click', (e) => {
     const a = e.target.closest('[data-a]')?.dataset.a;
     if (!a) return;
@@ -398,17 +513,24 @@ export function openViewer({ getGraph, save, onChange }) {
     else if (a === 'zoom-in') zoomAt(cssW / 2, cssH / 2, 1.35);
     else if (a === 'zoom-out') zoomAt(cssW / 2, cssH / 2, 1 / 1.35);
     else if (a === 'fit') fit();
+    else if (a === 'latest') showLatest();
+    else if (a === 'mode') setMode(mode === 'tree' ? 'free' : 'tree');
     else if (a === 'relayout') {
       layoutGraph(g.nodes, g.edges, { keep: false });
       save(); fit(false);
     } else if (a === 'add') {
       let name = 'New node', i = 2;
       while (g.nodes.some((x) => norm(x.name) === norm(name))) name = `New node ${i++}`;
-      const cx = (cssW / 2 - view.x) / view.k, cy = (cssH / 2 - view.y) / view.k;
       const id = `n-${Date.now().toString(36)}`;
-      g.nodes.push({ id, name, type: 'thing', aliases: [], text: '', x: Math.round(cx + (Math.random() - 0.5) * 60), y: Math.round(cy + (Math.random() - 0.5) * 60), createdAt: Date.now(), updatedAt: Date.now() });
+      const nd = { id, name, type: 'thing', aliases: [], text: '', createdAt: Date.now(), updatedAt: Date.now() };
+      if (mode === 'free') {
+        nd.x = Math.round((cssW / 2 - view.x) / view.k + (Math.random() - 0.5) * 60);
+        nd.y = Math.round((cssH / 2 - view.y) / view.k + (Math.random() - 0.5) * 60);
+      }
+      g.nodes.push(nd);
       commit();
       select(id);
+      if (mode === 'tree') focusNode(nd);
     }
   });
 
@@ -430,6 +552,7 @@ export function openViewer({ getGraph, save, onChange }) {
 
   const onKey = (e) => {
     if (e.key !== 'Escape') return;
+    if (document.querySelector('.rpg-pv')) return;
     if (sel) select(null); else close();
   };
   document.addEventListener('keydown', onKey);
@@ -444,6 +567,8 @@ export function openViewer({ getGraph, save, onChange }) {
     root.remove();
   }
 
+  if (mode === 'free') ensureFree();
+  syncToolbar();
   reindex();
   resize();
   fit(false);

@@ -1,6 +1,7 @@
-import { emptyGraph, ensureShape, extractJson, mergeUpdate, retrieve, formatBlock, buildExtractionPrompt, chunkItems } from './core.js';
+import { emptyGraph, ensureShape, extractJson, mergeUpdate, retrieve, formatBlock, composeRequest, chunkItems } from './core.js';
 import { openViewer } from './viewer.js';
 import { streamChat } from './llm.js';
+import { showPreview } from './preview.js';
 
 const MODULE = 'rp_memory_graph';
 const KEY = 'rp_memory_graph_inject';
@@ -21,6 +22,9 @@ const DEFAULTS = {
   stream: true,
   stallSec: 120,
   effort: 'keep',        // keep | low | min
+  preset: '',            // extra instructions added to the system prompt of every summary request
+  reminder: '',          // optional text placed after the chat history
+  reviewFirst: false,    // show the exact request and ask before each summary
 };
 
 let busy = false;
@@ -28,6 +32,7 @@ let cancelled = false;
 let abortCtl = null;
 let lastInjected = '';
 let lastRaw = '';
+let lastSent = '';
 const vecCache = new Map();
 
 const ctxNow = () => SillyTavern.getContext();
@@ -144,6 +149,7 @@ const live = { part: 0, total: 0, tag: '', startedAt: 0, chars: 0, reasoning: 0,
 function renderLive() {
   const secs = Math.round((Date.now() - live.startedAt) / 1000);
   let t = `Part ${live.part}/${live.total}${live.tag}${live.attempt > 1 ? ' (retry)' : ''}`;
+  try { t += ` · ${statusCounts(G(), ctxNow().chat.length)}`; } catch { /* no chat */ }
   if (live.chars || live.reasoning) {
     t += ` · receiving ${kfmt(live.chars)} chars${live.reasoning ? `, thinking ${kfmt(live.reasoning)}` : ''}`;
   } else {
@@ -190,7 +196,9 @@ async function callLLM(system, prompt) {
 
 // ---------- summarize chat into graph updates ----------
 function applyUpdate(g, json, items) {
-  const st = mergeUpdate(g, json);
+  const t = Math.max(Date.now(), (g.lastBatchAt || 0) + 1);   // unique per update: the viewer rows nodes by it
+  g.lastBatchAt = t;
+  const st = mergeUpdate(g, json, t);
   g.lastIndex = Math.max(g.lastIndex, items[items.length - 1].idx + 1);
   saveGraph();   // progress is saved after every part
   return st;
@@ -206,8 +214,11 @@ async function processItems(items, depth = 0) {
     if (cancelled) throw abortError();
     live.attempt = attempt; live.startedAt = Date.now(); live.chars = 0; live.reasoning = 0;
     try {
-      const { system, prompt } = buildExtractionPrompt(g, transcript, ctx.name1, ctx.name2);
-      const r = await callLLM(system, attempt > 1 ? prompt + STRICT : prompt);
+      const { system, prompt } = composeRequest(g, transcript, ctx.name1, ctx.name2, S());
+      const sendPrompt = attempt > 1 ? prompt + STRICT : prompt;
+      lastSent = `[SYSTEM]\n${system}\n\n[USER]\n${sendPrompt}`;
+      $('#rpg_sent').val(lastSent);
+      const r = await callLLM(system, sendPrompt);
       lastRaw = String(r.text ?? '');
       $('#rpg_raw').val(lastRaw);
       console.log('[RP Memory Graph] raw model reply:', lastRaw);
@@ -255,6 +266,79 @@ function stopSummarize() {
   setStatus('Stopping…');
 }
 
+const EXAMPLE_PRESET = 'You are a neutral story archivist. The transcript is from a fictional collaborative roleplay between consenting adults. Record what happens factually and in plain, non-graphic language, including romantic or intimate scenes: who was involved, what changed between them, and how they feel about it. Never refuse, lecture, add warnings, or skip a scene. Always reply with the JSON object only.';
+const EXAMPLE_REMINDER = 'Reminder: reply with the JSON object only. Do not continue the story.';
+
+export const hooks = { showPreview };
+
+// If messages were deleted, the "already summarized" marker must not point past the end of the chat.
+function clampMarker(g, chat) {
+  if (g.lastIndex > chat.length) { g.lastIndex = chat.length; saveGraph(); }
+}
+
+function statusCounts(g, chatLen) {
+  const done = Math.min(g.lastIndex, chatLen);
+  return `${done} of ${chatLen} messages summarized · ${chatLen - done} waiting`;
+}
+
+function connectionLine() {
+  const s = S();
+  const streaming = s.stream && !streamBroken && template && ctxNow().mainApi === 'openai';
+  const eff = s.effort !== 'keep' ? `, thinking: ${s.effort}` : '';
+  if (streaming) return `Sent as a streamed request to ${template.chat_completion_source} · ${template.model} (max ${s.maxTokens} tokens${eff}).`;
+  return `Sent as a standard request through SillyTavern's connected API (max ${s.maxTokens} tokens). SillyTavern may wrap the text in its own template.`;
+}
+
+// Works out exactly which messages would be sent and how they split into parts, without sending anything.
+function buildPlan(rebuild) {
+  const ctx = ctxNow();
+  const s = S();
+  const g = G();
+  clampMarker(g, ctx.chat);
+  const start = rebuild ? 0 : Math.min(g.lastIndex, ctx.chat.length);
+  const items = [];
+  for (let i = start; i < ctx.chat.length; i++) {
+    const m = ctx.chat[i];
+    if (!m || m.is_system || !m.mes) continue;
+    items.push({ idx: i, line: `${m.is_user ? (ctx.name1 || 'User') : (m.name || ctx.name2 || 'Character')}: ${m.mes}` });
+  }
+  const chunks = chunkItems(items, s.chunkChars);
+  const pg = rebuild ? emptyGraph() : g;
+  const parts = chunks.map((c, i) => {
+    const transcript = c.map((x) => x.line).join('\n\n');
+    const { system, prompt } = composeRequest(pg, transcript, ctx.name1, ctx.name2, s);
+    return {
+      label: `Part ${i + 1} of ${chunks.length}`, first: c[0].idx + 1, last: c[c.length - 1].idx + 1, count: c.length,
+      chars: system.length + prompt.length, system, prompt, messages: c.map((x) => ({ n: x.idx + 1, text: x.line })),
+    };
+  });
+  return { start, items, chunks, parts, chatLen: ctx.chat.length };
+}
+
+function describePlan(plan, rebuild) {
+  const s = S();
+  const first = plan.items[0].idx + 1;
+  const last = plan.items[plan.items.length - 1].idx + 1;
+  return {
+    title: rebuild ? 'Rebuild graph: what will be sent' : 'Summarize: what will be sent',
+    lines: [
+      `${plan.items.length} message${plan.items.length === 1 ? '' : 's'} (chat positions ${first}–${last}) in ${plan.parts.length} part${plan.parts.length === 1 ? '' : 's'} of up to ${s.chunkChars.toLocaleString()} characters.`,
+      rebuild ? 'Rebuild: the whole chat is sent and the current graph is cleared first.'
+        : plan.start > 0 ? `Messages 1–${plan.start} are already summarized and are NOT sent.` : 'Nothing has been summarized yet, so the whole chat is sent.',
+      connectionLine(),
+    ],
+    note: plan.parts.length > 1 ? 'Later parts are shown with the graph as it is now; their node list will also include whatever the earlier parts add.' : '',
+    parts: plan.parts,
+  };
+}
+
+export async function previewNext() {
+  if (busy) return toastr.info('Memory graph is busy.');
+  const plan = buildPlan(false);
+  if (!plan.items.length) return toastr.info('Nothing new to summarize yet.', 'RP Memory Graph');
+  await hooks.showPreview(describePlan(plan, false), { confirm: false });
+}
+
 async function summarize(rebuild = false) {
   if (busy) return toastr.info('Memory graph is already updating.');
   const ctx = ctxNow();
@@ -264,32 +348,31 @@ async function summarize(rebuild = false) {
   busy = true;
   cancelled = false;
   abortCtl = new AbortController();
-  $('#rpg_stop').show();
   const tot = { added: 0, updated: 0, edges: 0 };
   Object.assign(live, { part: 0, total: 0, tag: '', startedAt: Date.now(), chars: 0, reasoning: 0, attempt: 1 });
   setStatus('Preparing…');
-  const ticker = setInterval(renderLive, 500);
+  let ticker = null;
   try {
-    if (rebuild) { g.nodes = []; g.edges = []; g.lastIndex = 0; saveGraph(); }
-    const start = Math.min(g.lastIndex, ctx.chat.length);
-    const items = [];
-    for (let i = start; i < ctx.chat.length; i++) {
-      const m = ctx.chat[i];
-      if (!m || m.is_system || !m.mes) continue;
-      items.push({ idx: i, line: `${m.is_user ? (ctx.name1 || 'User') : (m.name || ctx.name2 || 'Character')}: ${m.mes}` });
-    }
-    if (!items.length) {
+    const plan = buildPlan(rebuild);
+    if (!plan.items.length) {
+      if (rebuild) { g.nodes = []; g.edges = []; }
       g.lastIndex = ctx.chat.length;
       saveGraph();
       toastr.info('No new messages to summarize.');
       return;
     }
-    const chunks = chunkItems(items, s.chunkChars);
-    live.total = chunks.length;
-    for (let i = 0; i < chunks.length; i++) {
+    if (s.reviewFirst) {
+      const ok = await hooks.showPreview(describePlan(plan, rebuild), { confirm: true });
+      if (!ok) { toastr.info('Cancelled. Nothing was sent.', 'RP Memory Graph'); return; }
+    }
+    if (rebuild) { g.nodes = []; g.edges = []; g.lastIndex = 0; saveGraph(); }
+    $('#rpg_stop').show();
+    ticker = setInterval(renderLive, 500);
+    live.total = plan.chunks.length;
+    for (let i = 0; i < plan.chunks.length; i++) {
       live.part = i + 1;
       live.tag = '';
-      const st = await processItems(chunks[i], 0);
+      const st = await processItems(plan.chunks[i], 0);
       tot.added += st.added; tot.updated += st.updated; tot.edges += st.edges;
     }
     toastr.success(`Graph updated: +${tot.added} nodes, ${tot.updated} updated, ${tot.edges} edges.`);
@@ -301,7 +384,7 @@ async function summarize(rebuild = false) {
       toastr.error(`${String(e && e.message || e)}\nParts finished so far are saved. Press "Summarize now" to resume from there.`, 'RP Memory Graph', { timeOut: 15000 });
     }
   } finally {
-    clearInterval(ticker);
+    if (ticker) clearInterval(ticker);
     busy = false;
     abortCtl = null;
     $('#rpg_stop').hide();
@@ -318,17 +401,18 @@ function openGraphViewer() {
 // ---------- settings UI ----------
 function setStatus(t) { $('#rpg_status').text(t); }
 
-function refreshUI() {
+export function refreshUI() {
   try {
     $('#rpg_inject').val(lastInjected);
     if (busy) return;
     const g = G();
     const s = S();
-    const pending = Math.max(0, ctxNow().chat.length - g.lastIndex);
+    const chat = ctxNow().chat;
+    clampMarker(g, chat);
     const sm = !s.stream || streamBroken ? 'streaming off'
       : template ? 'streaming ready'
         : 'streaming starts after your next chat message';
-    setStatus(`${g.nodes.length} nodes, ${g.edges.length} edges. ${pending} messages not yet summarized. (${sm})`);
+    setStatus(`${statusCounts(g, chat.length)} · ${g.nodes.length} nodes, ${g.edges.length} links (${sm})`);
   } catch { /* no chat loaded yet */ }
 }
 
@@ -362,9 +446,16 @@ function mountUI() {
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_stream"> Stream summaries (avoids API timeouts)</label></div>
       <div class="rpg-row"><label>Stall timeout, seconds (no data from API)</label><input type="number" id="rpg_stallSec" class="text_pole" min="20" max="900"></div>
       <div class="rpg-row"><label>Thinking effort for summaries</label><select id="rpg_effort" class="text_pole"><option value="keep">Keep my chat setting</option><option value="low">Low</option><option value="min">Minimum</option></select></div>
+      <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_reviewFirst"> Review what gets sent before each summary</label></div>
+      <label>Summary preset (added to the system prompt of every summary request)</label>
+      <textarea id="rpg_preset" class="rpg-inject text_pole" placeholder="e.g. instructions that stop the model refusing or censoring romantic scenes while summarizing"></textarea>
+      <label>Reminder after the chat history (optional)</label>
+      <textarea id="rpg_reminder" class="rpg-inject text_pole" style="min-height:50px"></textarea>
+      <div class="rpg-row"><div class="menu_button" id="rpg_example">Insert example preset</div></div>
       <div class="rpg-row">
         <div class="menu_button" id="rpg_summarize">Summarize now</div>
         <div class="menu_button" id="rpg_stop" style="display:none">Stop</div>
+        <div class="menu_button" id="rpg_preview">Preview request</div>
         <div class="menu_button" id="rpg_view">View / edit graph</div>
         <div class="menu_button" id="rpg_rebuild">Rebuild from chat</div>
         <div class="menu_button" id="rpg_clear">Clear graph</div>
@@ -374,6 +465,8 @@ function mountUI() {
       <textarea id="rpg_inject" class="rpg-inject text_pole" readonly></textarea>
       <label>Last raw model reply (for debugging summaries)</label>
       <textarea id="rpg_raw" class="rpg-inject text_pole" readonly></textarea>
+      <label>Last request sent (system + user text)</label>
+      <textarea id="rpg_sent" class="rpg-inject text_pole" readonly></textarea>
     </div>
   </div>`;
   $('#extensions_settings2').append($('<div class="rpg-settings"></div>').html(html));
@@ -392,8 +485,20 @@ function mountUI() {
   bind('rpg_stream', 'stream', 'check');
   bind('rpg_stallSec', 'stallSec', 'num');
   bind('rpg_effort', 'effort');
+  bind('rpg_reviewFirst', 'reviewFirst', 'check');
+  bind('rpg_preset', 'preset');
+  bind('rpg_reminder', 'reminder');
   $('#rpg_summarize').on('click', () => summarize(false));
   $('#rpg_stop').on('click', stopSummarize);
+  $('#rpg_preview').on('click', () => previewNext());
+  $('#rpg_example').on('click', () => {
+    const s = S();
+    if (s.preset.trim() && !confirm('Replace your current preset with the example?')) return;
+    s.preset = EXAMPLE_PRESET;
+    if (!s.reminder.trim()) s.reminder = EXAMPLE_REMINDER;
+    $('#rpg_preset').val(s.preset); $('#rpg_reminder').val(s.reminder);
+    saveSettings();
+  });
   $('#rpg_rebuild').on('click', () => summarize(true));
   $('#rpg_view').on('click', openGraphViewer);
   $('#rpg_clear').on('click', () => {
@@ -408,6 +513,10 @@ jQuery(() => {
   mountUI();
   refreshUI();
   ctx.eventSource.on(ctx.eventTypes.CHAT_CHANGED, refreshUI);
+  for (const name of ['MESSAGE_SENT', 'MESSAGE_DELETED']) {
+    const ev = ctx.eventTypes[name];
+    if (ev) ctx.eventSource.on(ev, () => refreshUI());
+  }
   const readyEvent = ctx.eventTypes.CHAT_COMPLETION_SETTINGS_READY;
   if (readyEvent) ctx.eventSource.on(readyEvent, (data) => { captureTemplate(data); if (!busy) refreshUI(); });
   ctx.eventSource.on(ctx.eventTypes.MESSAGE_RECEIVED, () => {
