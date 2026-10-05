@@ -18,6 +18,10 @@ Install from the GitHub link in SillyTavern (Extensions -> Install extension). T
 - **Last request sent** in the settings shows the most recent request that actually went out.
 - The status line reads "X of Y messages summarized · Z waiting" and updates after every part, including failed runs.
 
+## Regex scripts and prompt caching
+- **Apply SillyTavern regex scripts**: messages go through your Regex extension scripts (including "prompt only" ones, with the right depth) before being summarized, so things like GFX/status blocks are stripped exactly as in a normal reply. The Preview shows the cleaned text.
+- **Cache-friendly injection**: the memory block goes at the very end of the chat, in a fixed order, and its text only changes when a node that is not already in it becomes relevant. Providers cache the unchanged start of a prompt, so a block that moved or changed every turn broke caching.
+
 ## Graph view
 Default **Tree** layout: the first node is at the top and each summary adds its nodes in a new band below, labelled "Update N", so the story reads top to bottom. **Latest** jumps to the newest nodes (ringed). **Layout: Free** switches to the draggable map.
 

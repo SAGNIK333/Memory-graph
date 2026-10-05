@@ -25,6 +25,8 @@ const DEFAULTS = {
   preset: '',            // extra instructions added to the system prompt of every summary request
   reminder: '',          // optional text placed after the chat history
   reviewFirst: false,    // show the exact request and ask before each summary
+  applyRegex: true,      // run SillyTavern's own regex scripts (prompt-only ones too) on messages before summarizing
+  cacheMode: true,       // inject at the very end and keep the block stable, so provider prompt caching keeps working
 };
 
 let busy = false;
@@ -36,6 +38,28 @@ let lastSent = '';
 const vecCache = new Map();
 
 const ctxNow = () => SillyTavern.getContext();
+
+// SillyTavern's regex engine (the Regex extension). Not part of getContext(), so it is imported on demand.
+let rx = null;
+async function ensureRegex() {
+  if (rx || !S().applyRegex) return;
+  try {
+    rx = await hooks.loadRegex();
+  } catch (e) {
+    console.warn('[RP Memory Graph] could not load the SillyTavern regex engine; messages are summarized unfiltered:', e);
+  }
+}
+function regexed(m, depth) {
+  const text = String(m.mes || '');
+  if (!rx || !S().applyRegex || typeof rx.getRegexedString !== 'function') return text;
+  try {
+    const place = m.is_user ? rx.regex_placement.USER_INPUT : rx.regex_placement.AI_OUTPUT;
+    return rx.getRegexedString(text, place, { isPrompt: true, depth });
+  } catch (e) {
+    console.warn('[RP Memory Graph] regex failed on a message:', e);
+    return text;
+  }
+}
 
 function S() {
   const st = ctxNow().extensionSettings;
@@ -74,6 +98,29 @@ async function embed(texts) {
 }
 
 // ---------- retrieval + injection (runs before every generation) ----------
+// Cache-friendly block: the same text is reused for as long as the newly relevant nodes were already in it.
+// A provider's prompt cache only helps while everything before the injected text stays identical.
+let stickyIds = null;
+function stableBlock(g, res, topK) {
+  const want = res.picked.map((p) => p.node.id);
+  const have = (stickyIds || []).filter((id) => g.nodes.some((n) => n.id === id));
+  let ids;
+  if (!want.length) ids = have;                                                      // nothing matched: keep what was there
+  else if (want.every((id) => have.includes(id))) ids = have;                        // nothing new: block text stays the same
+  else {
+    const union = [...have, ...want.filter((id) => !have.includes(id))];
+    ids = union.length <= topK + 3 ? union : want;                                   // grow a little, then start over
+  }
+  stickyIds = ids;
+  if (!ids.length) return '';
+  const order = new Map(g.nodes.map((n, i) => [n.id, i]));
+  ids.sort((a, b) => order.get(a) - order.get(b));                                   // fixed order, not by score
+  const idSet = new Set(ids);
+  const picked = ids.map((id) => ({ node: g.nodes.find((n) => n.id === id), score: 1 }));
+  const edges = g.edges.filter((e) => idSet.has(e.from) || idSet.has(e.to)).slice(0, 12);
+  return formatBlock(g, { picked, edges });
+}
+
 globalThis.rpGraphIntercept = async function (chat, _contextSize, _abort, type) {
   try {
     const s = S();
@@ -100,9 +147,15 @@ globalThis.rpGraphIntercept = async function (chat, _contextSize, _abort, type) 
       }
     }
     const res = retrieve(g, { query, topK: s.topK, threshold: s.threshold, qVec, nodeVecs, vecFloor: s.vecFloor });
-    const block = formatBlock(g, res);
+    let block;
+    if (s.cacheMode) {
+      block = stableBlock(g, res, s.topK);
+    } else {
+      stickyIds = null;
+      block = formatBlock(g, res);
+    }
     lastInjected = block;
-    ctx.setExtensionPrompt(KEY, block, 1, s.depth, false, 0);
+    ctx.setExtensionPrompt(KEY, block, 1, s.cacheMode ? 0 : s.depth, false, 0);
     $('#rpg_inject').val(block);
   } catch (e) {
     console.error('[RP Memory Graph] intercept error', e);
@@ -269,7 +322,7 @@ function stopSummarize() {
 const EXAMPLE_PRESET = 'You are a neutral story archivist. The transcript is from a fictional collaborative roleplay between consenting adults. Record what happens factually and in plain, non-graphic language, including romantic or intimate scenes: who was involved, what changed between them, and how they feel about it. Never refuse, lecture, add warnings, or skip a scene. Always reply with the JSON object only.';
 const EXAMPLE_REMINDER = 'Reminder: reply with the JSON object only. Do not continue the story.';
 
-export const hooks = { showPreview };
+export const hooks = { showPreview, loadRegex: () => import(/* webpackIgnore: true */ '/scripts/extensions/regex/engine.js') };
 
 // If messages were deleted, the "already summarized" marker must not point past the end of the chat.
 function clampMarker(g, chat) {
@@ -297,10 +350,16 @@ function buildPlan(rebuild) {
   clampMarker(g, ctx.chat);
   const start = rebuild ? 0 : Math.min(g.lastIndex, ctx.chat.length);
   const items = [];
+  // depth = how many prompt messages come after this one, which is what SillyTavern's regex min/max depth refers to
+  const usable = [];
+  ctx.chat.forEach((m, i) => { if (m && !m.is_system) usable.push(i); });
+  const depthOf = new Map(usable.map((i, k) => [i, usable.length - k - 1]));
   for (let i = start; i < ctx.chat.length; i++) {
     const m = ctx.chat[i];
     if (!m || m.is_system || !m.mes) continue;
-    items.push({ idx: i, line: `${m.is_user ? (ctx.name1 || 'User') : (m.name || ctx.name2 || 'Character')}: ${m.mes}` });
+    const text = regexed(m, depthOf.get(i)).trim();
+    if (!text) continue;
+    items.push({ idx: i, line: `${m.is_user ? (ctx.name1 || 'User') : (m.name || ctx.name2 || 'Character')}: ${text}` });
   }
   const chunks = chunkItems(items, s.chunkChars);
   const pg = rebuild ? emptyGraph() : g;
@@ -334,6 +393,7 @@ function describePlan(plan, rebuild) {
 
 export async function previewNext() {
   if (busy) return toastr.info('Memory graph is busy.');
+  await ensureRegex();
   const plan = buildPlan(false);
   if (!plan.items.length) return toastr.info('Nothing new to summarize yet.', 'RP Memory Graph');
   await hooks.showPreview(describePlan(plan, false), { confirm: false });
@@ -353,6 +413,7 @@ async function summarize(rebuild = false) {
   setStatus('Preparing…');
   let ticker = null;
   try {
+    await ensureRegex();
     const plan = buildPlan(rebuild);
     if (!plan.items.length) {
       if (rebuild) { g.nodes = []; g.edges = []; }
@@ -446,6 +507,8 @@ function mountUI() {
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_stream"> Stream summaries (avoids API timeouts)</label></div>
       <div class="rpg-row"><label>Stall timeout, seconds (no data from API)</label><input type="number" id="rpg_stallSec" class="text_pole" min="20" max="900"></div>
       <div class="rpg-row"><label>Thinking effort for summaries</label><select id="rpg_effort" class="text_pole"><option value="keep">Keep my chat setting</option><option value="low">Low</option><option value="min">Minimum</option></select></div>
+      <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_applyRegex"> Apply SillyTavern regex scripts to messages before summarizing (strips things like GFX blocks)</label></div>
+      <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_cacheMode"> Cache-friendly injection (keeps prompt caching working; injects at the end and keeps the memory text steady)</label></div>
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_reviewFirst"> Review what gets sent before each summary</label></div>
       <label>Summary preset (added to the system prompt of every summary request)</label>
       <textarea id="rpg_preset" class="rpg-inject text_pole" placeholder="e.g. instructions that stop the model refusing or censoring romantic scenes while summarizing"></textarea>
@@ -486,6 +549,8 @@ function mountUI() {
   bind('rpg_stallSec', 'stallSec', 'num');
   bind('rpg_effort', 'effort');
   bind('rpg_reviewFirst', 'reviewFirst', 'check');
+  bind('rpg_applyRegex', 'applyRegex', 'check');
+  bind('rpg_cacheMode', 'cacheMode', 'check');
   bind('rpg_preset', 'preset');
   bind('rpg_reminder', 'reminder');
   $('#rpg_summarize').on('click', () => summarize(false));
