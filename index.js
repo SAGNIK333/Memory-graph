@@ -26,6 +26,8 @@ const DEFAULTS = {
   reminder: '',          // optional text placed after the chat history
   reviewFirst: false,    // show the exact request and ask before each summary
   applyRegex: true,      // run SillyTavern's own regex scripts (prompt-only ones too) on messages before summarizing
+  injectRole: 'user',    // 'user' or 'system'. A system-role block can be moved into the top system prompt by OpenRouter/Anthropic conversion, which breaks the whole cache
+  cacheDebug: true,      // compare each outgoing prompt with the previous one and report where they first differ
   cacheMode: true,       // inject at the very end and keep the block stable, so provider prompt caching keeps working
 };
 
@@ -100,10 +102,21 @@ async function embed(texts) {
 // ---------- retrieval + injection (runs before every generation) ----------
 // Cache-friendly block: the same text is reused for as long as the newly relevant nodes were already in it.
 // A provider's prompt cache only helps while everything before the injected text stays identical.
-let stickyIds = null;
+// The remembered set is stored per chat (chat metadata), so a page reload or switching chats does not change the block text.
+const STICKY_KEY = `${MODULE}_sticky`;
+function getSticky() {
+  const v = ctxNow().chatMetadata[STICKY_KEY];
+  return Array.isArray(v) ? v : null;
+}
+function setSticky(ids) {
+  const ctx = ctxNow();
+  if (JSON.stringify(ctx.chatMetadata[STICKY_KEY] ?? null) === JSON.stringify(ids)) return;
+  ctx.chatMetadata[STICKY_KEY] = ids;
+  (ctx.saveMetadataDebounced || ctx.saveMetadata)();
+}
 function stableBlock(g, res, topK) {
   const want = res.picked.map((p) => p.node.id);
-  const have = (stickyIds || []).filter((id) => g.nodes.some((n) => n.id === id));
+  const have = (getSticky() || []).filter((id) => g.nodes.some((n) => n.id === id));
   let ids;
   if (!want.length) ids = have;                                                      // nothing matched: keep what was there
   else if (want.every((id) => have.includes(id))) ids = have;                        // nothing new: block text stays the same
@@ -111,7 +124,7 @@ function stableBlock(g, res, topK) {
     const union = [...have, ...want.filter((id) => !have.includes(id))];
     ids = union.length <= topK + 3 ? union : want;                                   // grow a little, then start over
   }
-  stickyIds = ids;
+  setSticky(ids);
   if (!ids.length) return '';
   const order = new Map(g.nodes.map((n, i) => [n.id, i]));
   ids.sort((a, b) => order.get(a) - order.get(b));                                   // fixed order, not by score
@@ -128,7 +141,7 @@ globalThis.rpGraphIntercept = async function (chat, _contextSize, _abort, type) 
     if (!s.enabled || type === 'quiet') return;
     const g = G();
     if (!g.nodes.length) {
-      ctx.setExtensionPrompt(KEY, '', 1, s.depth, false, 0);
+      ctx.setExtensionPrompt(KEY, '', 1, s.depth, false, s.injectRole === 'system' ? 0 : 1);
       lastInjected = '';
       return;
     }
@@ -151,16 +164,57 @@ globalThis.rpGraphIntercept = async function (chat, _contextSize, _abort, type) 
     if (s.cacheMode) {
       block = stableBlock(g, res, s.topK);
     } else {
-      stickyIds = null;
+      setSticky(null);
       block = formatBlock(g, res);
     }
+    block = block.replace(/\{\{/g, '{ {').replace(/\}\}/g, '} }');
     lastInjected = block;
-    ctx.setExtensionPrompt(KEY, block, 1, s.cacheMode ? 0 : s.depth, false, 0);
+    ctx.setExtensionPrompt(KEY, block, 1, s.cacheMode ? 0 : s.depth, false, s.injectRole === 'system' ? 0 : 1);
     $('#rpg_inject').val(block);
   } catch (e) {
     console.error('[RP Memory Graph] intercept error', e);
   }
 };
+
+
+// ---------- cache diagnostics ----------
+// Compares each outgoing chat request with the previous one. A provider can only reuse the part of the prompt that is
+// identical from the start, so "first difference at message N" tells exactly where caching stops.
+let prevPrompt = null;
+let cacheReportText = '';
+const flatMsg = (m) => `${m.role}\u0001${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`;
+function cacheReport(data) {
+  try {
+    if (!S().cacheDebug || busy || !data || data.dryRun || !Array.isArray(data.chat)) return;
+    const cur = data.chat.map(flatMsg);
+    const probe = lastInjected ? lastInjected.slice(0, 40) : '';
+    const blockAt = probe ? cur.findIndex((t) => t.includes(probe)) : -1;
+    const where = blockAt === -1 ? 'no memory block in this prompt' : blockAt >= cur.length - 2 ? `memory block at message ${blockAt + 1}/${cur.length} (end, fine)` : `memory block at message ${blockAt + 1}/${cur.length} (NOT at the end)`;
+    let text;
+    if (!prevPrompt) {
+      text = `${cur.length} messages. ${where}. (first request, nothing to compare with yet)`;
+    } else {
+      const n = Math.min(prevPrompt.length, cur.length);
+      let i = 0;
+      while (i < n && prevPrompt[i] === cur[i]) i++;
+      let sharedChars = 0;
+      for (let k = 0; k < i; k++) sharedChars += cur[k].length;
+      if (i === prevPrompt.length) {
+        text = `${cur.length} messages. Everything in the previous request (${i} messages, ~${Math.round(sharedChars / 4)} tokens) is unchanged at the start: good for caching. ${where}.`;
+      } else {
+        const a = prevPrompt[i], b = cur[i];
+        let c = 0;
+        while (c < a.length && c < b.length && a[c] === b[c]) c++;
+        const snip = (t) => JSON.stringify(t.slice(Math.max(0, c - 30), c + 50));
+        text = `${cur.length} messages. Caching stops at message ${i + 1}/${cur.length} (~${Math.round((sharedChars + c) / 4)} tokens in). ${where}.\nwas: ${snip(a)}\nnow: ${snip(b)}`;
+      }
+    }
+    prevPrompt = cur;
+    cacheReportText = text;
+    console.log('[RP Memory Graph] cache check:', text);
+    $('#rpg_cache').val(text);
+  } catch (e) { console.warn('[RP Memory Graph] cache check failed', e); }
+}
 
 // ---------- learn the user's connection from SillyTavern's own requests ----------
 let template = null;        // the last chat-completion request ST built, minus its messages
@@ -465,6 +519,7 @@ function setStatus(t) { $('#rpg_status').text(t); }
 export function refreshUI() {
   try {
     $('#rpg_inject').val(lastInjected);
+    $('#rpg_cache').val(cacheReportText);
     if (busy) return;
     const g = G();
     const s = S();
@@ -509,6 +564,8 @@ function mountUI() {
       <div class="rpg-row"><label>Thinking effort for summaries</label><select id="rpg_effort" class="text_pole"><option value="keep">Keep my chat setting</option><option value="low">Low</option><option value="min">Minimum</option></select></div>
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_applyRegex"> Apply SillyTavern regex scripts to messages before summarizing (strips things like GFX blocks)</label></div>
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_cacheMode"> Cache-friendly injection (keeps prompt caching working; injects at the end and keeps the memory text steady)</label></div>
+      <div class="rpg-row"><label>Memory block role (user keeps caching intact on OpenRouter/Claude)</label><select id="rpg_injectRole" class="text_pole"><option value="user">User (recommended)</option><option value="system">System</option></select></div>
+      <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_cacheDebug"> Cache check: show where each request first differs from the previous one</label></div>
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_reviewFirst"> Review what gets sent before each summary</label></div>
       <label>Summary preset (added to the system prompt of every summary request)</label>
       <textarea id="rpg_preset" class="rpg-inject text_pole" placeholder="e.g. instructions that stop the model refusing or censoring romantic scenes while summarizing"></textarea>
@@ -524,6 +581,8 @@ function mountUI() {
         <div class="menu_button" id="rpg_clear">Clear graph</div>
       </div>
       <div class="rpg-status" id="rpg_status"></div>
+      <label>Cache check (this request vs the previous one)</label>
+      <textarea id="rpg_cache" class="rpg-inject text_pole" readonly></textarea>
       <label>Last injected block</label>
       <textarea id="rpg_inject" class="rpg-inject text_pole" readonly></textarea>
       <label>Last raw model reply (for debugging summaries)</label>
@@ -551,6 +610,8 @@ function mountUI() {
   bind('rpg_reviewFirst', 'reviewFirst', 'check');
   bind('rpg_applyRegex', 'applyRegex', 'check');
   bind('rpg_cacheMode', 'cacheMode', 'check');
+  bind('rpg_cacheDebug', 'cacheDebug', 'check');
+  bind('rpg_injectRole', 'injectRole');
   bind('rpg_preset', 'preset');
   bind('rpg_reminder', 'reminder');
   $('#rpg_summarize').on('click', () => summarize(false));
@@ -582,6 +643,7 @@ jQuery(() => {
     const ev = ctx.eventTypes[name];
     if (ev) ctx.eventSource.on(ev, () => refreshUI());
   }
+  if (ctx.eventTypes.CHAT_COMPLETION_PROMPT_READY) ctx.eventSource.on(ctx.eventTypes.CHAT_COMPLETION_PROMPT_READY, cacheReport);
   const readyEvent = ctx.eventTypes.CHAT_COMPLETION_SETTINGS_READY;
   if (readyEvent) ctx.eventSource.on(readyEvent, (data) => { captureTemplate(data); if (!busy) refreshUI(); });
   ctx.eventSource.on(ctx.eventTypes.MESSAGE_RECEIVED, () => {

@@ -22,6 +22,14 @@ Install from the GitHub link in SillyTavern (Extensions -> Install extension). T
 - **Apply SillyTavern regex scripts**: messages go through your Regex extension scripts (including "prompt only" ones, with the right depth) before being summarized, so things like GFX/status blocks are stripped exactly as in a normal reply. The Preview shows the cleaned text.
 - **Cache-friendly injection**: the memory block goes at the very end of the chat, in a fixed order, and its text only changes when a node that is not already in it becomes relevant. Providers cache the unchanged start of a prompt, so a block that moved or changed every turn broke caching.
 
+## Cache check (finding what breaks prompt caching)
+
+Tick **Cache check** in the settings. Every chat request is compared with the one before it, and the box **Cache check** (also the browser console) says where they first differ, e.g. `Caching stops at message 4/60 (~3,100 tokens in)` with the old and new text at that point. If the difference is early in the prompt, the cause is not the memory block (which sits at the end): it is something else in the prompt, or the oldest chat messages being trimmed to fit the context size. The remembered node set is now stored per chat, so a page reload no longer changes the block text, and `{{macros}}` inside node text are neutralised so SillyTavern cannot re-expand them every turn.
+
+## Memory block role (OpenRouter / Claude)
+
+The block is injected as a **user**-role message at the end by default. A system-role message at the end can be moved by the provider (or its conversion layer) into the top system prompt, so every change to the block then invalidates the whole cache. Switch to *System* in the settings only if you need that.
+
 ## Graph view
 Default **Tree** layout: the first node is at the top and each summary adds its nodes in a new band below, labelled "Update N", so the story reads top to bottom. **Latest** jumps to the newest nodes (ringed). **Layout: Free** switches to the draggable map.
 
