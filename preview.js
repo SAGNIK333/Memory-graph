@@ -26,7 +26,7 @@ export function showPreview(plan, { confirm = true } = {}) {
           ${confirm ? `<button class="rpg-btn primary" data-a="send">Send ${parts.length} part${parts.length === 1 ? '' : 's'}</button>` : '<button class="rpg-btn primary" data-a="cancel">Close</button>'}
         </div>
       </div>`;
-    document.body.appendChild(root);
+    (document.fullscreenElement || document.webkitFullscreenElement || document.body).appendChild(root);
     const body = root.querySelector('.rpg-pv-body');
 
     function render() {

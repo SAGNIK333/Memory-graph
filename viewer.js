@@ -22,6 +22,10 @@ const when = (t) => {
   } catch { return ''; }
 };
 
+// The Code Window extension uses the browser's real fullscreen; while an element is fullscreen, anything attached to
+// <body> is hidden behind it. So mount inside the fullscreen element when there is one, and follow fullscreen changes.
+const fsHost = () => document.fullscreenElement || document.webkitFullscreenElement || document.body;
+
 export function openViewer({ getGraph, save, onChange }) {
   if (document.querySelector('.rpg-ov')) return;
   const g = getGraph();
@@ -71,7 +75,10 @@ export function openViewer({ getGraph, save, onChange }) {
       </div>
       <aside class="rpg-panel" hidden></aside>
     </div>`;
-  document.body.appendChild(root);
+  fsHost().appendChild(root);
+  const onFs = () => { const h = fsHost(); if (root.parentNode !== h) h.appendChild(root); };
+  document.addEventListener('fullscreenchange', onFs);
+  document.addEventListener('webkitfullscreenchange', onFs);
 
   const $ = (s) => root.querySelector(s);
   const stage = $('.rpg-stage');
@@ -563,6 +570,8 @@ export function openViewer({ getGraph, save, onChange }) {
     cancelAnimationFrame(anim);
     cancelAnimationFrame(raf);
     document.removeEventListener('keydown', onKey);
+    document.removeEventListener('fullscreenchange', onFs);
+    document.removeEventListener('webkitfullscreenchange', onFs);
     ro.disconnect();
     root.remove();
   }

@@ -636,6 +636,8 @@ function mountUI() {
 
 jQuery(() => {
   const ctx = ctxNow();
+  // lets other extensions (e.g. Code Window) open the graph without going through the settings panel
+  window.rpMemoryGraph = { open: openGraphViewer, version: '0.1.1' };
   mountUI();
   refreshUI();
   ctx.eventSource.on(ctx.eventTypes.CHAT_CHANGED, refreshUI);
