@@ -28,7 +28,7 @@ Tick **Cache check** in the settings. Every chat request is compared with the on
 
 ## Memory block role (OpenRouter / Claude)
 
-The block is injected as a **user**-role message at the end by default. A system-role message at the end can be moved by the provider (or its conversion layer) into the top system prompt, so every change to the block then invalidates the whole cache. Switch to *System* in the settings only if you need that.
+The block is injected as a **user**-role message at the end by default. A system-role message at the end can be moved by the provider (or its conversion layer) into the top system prompt, so every change to the block then invalidates the whole cache. Switch to *System* in the settings only if you need that. *Assistant* is also available; at the very end of the prompt an assistant-role message acts as a prefill, which some Claude models reject, so use it only if your setup accepts that.
 
 ## Graph view
 Default **Tree** layout: the first node is at the top and each summary adds its nodes in a new band below, labelled "Update N", so the story reads top to bottom. **Latest** jumps to the newest nodes (ringed). **Layout: Free** switches to the draggable map.
@@ -50,6 +50,8 @@ Settings that matter for thinking models:
 
 ## Embeddings (BGE-M3)
 Tick "Use embeddings" and point it at any OpenAI-compatible `/v1/embeddings` or Ollama endpoint, e.g. `http://localhost:11434/v1/embeddings`, model `bge-m3`. If it fails, matching silently falls back to keywords.
+
+Vectors are kept in memory only, keyed by URL + model, so changing the model never reuses old vectors. The **Re-embed all nodes** button clears them and embeds every node again with the current model (with progress), which also warms the cache so the next reply is fast.
 
 ## Tests
 `node test.mjs; node test2.mjs; node test3.mjs; node test4.mjs; node test5.mjs` (logic, parser, streaming client, graph rules, and the whole summarizer against a fake SillyTavern).

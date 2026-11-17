@@ -26,7 +26,7 @@ const DEFAULTS = {
   reminder: '',          // optional text placed after the chat history
   reviewFirst: false,    // show the exact request and ask before each summary
   applyRegex: true,      // run SillyTavern's own regex scripts (prompt-only ones too) on messages before summarizing
-  injectRole: 'user',    // 'user' or 'system'. A system-role block can be moved into the top system prompt by OpenRouter/Anthropic conversion, which breaks the whole cache
+  injectRole: 'user',    // 'user', 'system' or 'assistant'. A system-role block can be moved into the top system prompt by OpenRouter/Anthropic conversion, which breaks the whole cache
   cacheDebug: true,      // compare each outgoing prompt with the previous one and report where they first differ
   cacheMode: true,       // inject at the very end and keep the block stable, so provider prompt caching keeps working
 };
@@ -40,6 +40,10 @@ let lastSent = '';
 const vecCache = new Map();
 
 const ctxNow = () => SillyTavern.getContext();
+
+// SillyTavern's extension prompt roles: 0 = system, 1 = user, 2 = assistant
+const ROLE_NUM = { system: 0, user: 1, assistant: 2 };
+const roleNum = (s) => (s.injectRole in ROLE_NUM ? ROLE_NUM[s.injectRole] : 1);
 
 // SillyTavern's regex engine (the Regex extension). Not part of getContext(), so it is imported on demand.
 let rx = null;
@@ -83,9 +87,11 @@ const saveGraph = () => ctxNow().saveMetadata();
 const nodeText = (n) => `${n.name}. ${n.text}`;
 
 // ---------- embeddings (optional, any OpenAI-compatible or Ollama endpoint) ----------
+// The cache key includes the URL and model, so changing the embeddings model can never reuse vectors made by the old one.
+const vkey = (s, t) => `${s.embedUrl}\u0001${s.embedModel}\u0001${t}`;
 async function embed(texts) {
   const s = S();
-  const need = [...new Set(texts)].filter((t) => !vecCache.has(t));
+  const need = [...new Set(texts)].filter((t) => !vecCache.has(vkey(s, t)));
   if (need.length) {
     const headers = { 'Content-Type': 'application/json' };
     if (s.embedKey) headers.Authorization = `Bearer ${s.embedKey}`;
@@ -94,10 +100,52 @@ async function embed(texts) {
     const j = await res.json();
     const arr = j.data ? j.data.map((d) => d.embedding) : j.embeddings;
     if (!arr || arr.length !== need.length) throw new Error('Unexpected embedding response');
-    need.forEach((t, i) => vecCache.set(t, arr[i]));
+    need.forEach((t, i) => vecCache.set(vkey(s, t), arr[i]));
   }
-  return texts.map((t) => vecCache.get(t));
+  return texts.map((t) => vecCache.get(vkey(s, t)));
 }
+
+// Forgets every stored vector and embeds all nodes again with the current model, in small batches with progress.
+// Vectors only live in memory (nothing is saved in the chat), so this also pre-warms the cache: the first reply
+// after a restart or a model change then only has to embed the query instead of every node.
+let reembedding = false;
+async function reembedAll() {
+  if (busy) return toastr.info('Memory graph is busy summarizing.', 'RP Memory Graph');
+  if (reembedding) return toastr.info('Already re-embedding.', 'RP Memory Graph');
+  const s = S();
+  const g = G();
+  if (!g.nodes.length) return toastr.info('No nodes in this chat\'s graph yet.', 'RP Memory Graph');
+  if (!s.embedUrl || !s.embedModel) return toastr.warning('Set the embeddings URL and model first.', 'RP Memory Graph');
+  reembedding = true;
+  $('#rpg_reembed').addClass('disabled');
+  const t0 = Date.now();
+  const BATCH = 16;
+  const texts = g.nodes.map(nodeText);
+  let done = 0;
+  let dims = 0;
+  try {
+    vecCache.clear();
+    for (let i = 0; i < texts.length; i += BATCH) {
+      const part = texts.slice(i, i + BATCH);
+      const vecs = await embed(part);
+      if (!dims && vecs[0]) dims = vecs[0].length;
+      done += part.length;
+      setStatus(`Re-embedding with ${s.embedModel}: ${done}/${texts.length} nodes…`);
+    }
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    toastr.success(`Re-embedded ${done} node${done === 1 ? '' : 's'} with ${s.embedModel} (${dims} dimensions, ${secs}s).`, 'RP Memory Graph');
+    if (!s.useEmbeddings) toastr.info('"Use embeddings" is off, so these vectors are not used until you tick it.', 'RP Memory Graph');
+  } catch (e) {
+    console.error('[RP Memory Graph] re-embed failed', e);
+    vecCache.clear();
+    toastr.error(`Re-embedding failed after ${done}/${texts.length} nodes: ${String(e && e.message || e)}\nCheck the URL/model and that Ollama is running.`, 'RP Memory Graph', { timeOut: 12000 });
+  } finally {
+    reembedding = false;
+    $('#rpg_reembed').removeClass('disabled');
+    refreshUI();
+  }
+}
+export { reembedAll };
 
 // ---------- retrieval + injection (runs before every generation) ----------
 // Cache-friendly block: the same text is reused for as long as the newly relevant nodes were already in it.
@@ -141,7 +189,7 @@ globalThis.rpGraphIntercept = async function (chat, _contextSize, _abort, type) 
     if (!s.enabled || type === 'quiet') return;
     const g = G();
     if (!g.nodes.length) {
-      ctx.setExtensionPrompt(KEY, '', 1, s.depth, false, s.injectRole === 'system' ? 0 : 1);
+      ctx.setExtensionPrompt(KEY, '', 1, s.depth, false, roleNum(s));
       lastInjected = '';
       return;
     }
@@ -169,7 +217,7 @@ globalThis.rpGraphIntercept = async function (chat, _contextSize, _abort, type) 
     }
     block = block.replace(/\{\{/g, '{ {').replace(/\}\}/g, '} }');
     lastInjected = block;
-    ctx.setExtensionPrompt(KEY, block, 1, s.cacheMode ? 0 : s.depth, false, s.injectRole === 'system' ? 0 : 1);
+    ctx.setExtensionPrompt(KEY, block, 1, s.cacheMode ? 0 : s.depth, false, roleNum(s));
     $('#rpg_inject').val(block);
   } catch (e) {
     console.error('[RP Memory Graph] intercept error', e);
@@ -520,7 +568,7 @@ export function refreshUI() {
   try {
     $('#rpg_inject').val(lastInjected);
     $('#rpg_cache').val(cacheReportText);
-    if (busy) return;
+    if (busy || reembedding) return;
     const g = G();
     const s = S();
     const chat = ctxNow().chat;
@@ -564,7 +612,7 @@ function mountUI() {
       <div class="rpg-row"><label>Thinking effort for summaries</label><select id="rpg_effort" class="text_pole"><option value="keep">Keep my chat setting</option><option value="low">Low</option><option value="min">Minimum</option></select></div>
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_applyRegex"> Apply SillyTavern regex scripts to messages before summarizing (strips things like GFX blocks)</label></div>
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_cacheMode"> Cache-friendly injection (keeps prompt caching working; injects at the end and keeps the memory text steady)</label></div>
-      <div class="rpg-row"><label>Memory block role (user keeps caching intact on OpenRouter/Claude)</label><select id="rpg_injectRole" class="text_pole"><option value="user">User (recommended)</option><option value="system">System</option></select></div>
+      <div class="rpg-row"><label>Memory block role (user keeps caching intact on OpenRouter/Claude)</label><select id="rpg_injectRole" class="text_pole"><option value="user">User (recommended)</option><option value="system">System</option><option value="assistant">Assistant (at the end this can act as a prefill)</option></select></div>
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_cacheDebug"> Cache check: show where each request first differs from the previous one</label></div>
       <div class="rpg-row"><label class="checkbox_label"><input type="checkbox" id="rpg_reviewFirst"> Review what gets sent before each summary</label></div>
       <label>Summary preset (added to the system prompt of every summary request)</label>
@@ -578,6 +626,7 @@ function mountUI() {
         <div class="menu_button" id="rpg_preview">Preview request</div>
         <div class="menu_button" id="rpg_view">View / edit graph</div>
         <div class="menu_button" id="rpg_rebuild">Rebuild from chat</div>
+        <div class="menu_button" id="rpg_reembed">Re-embed all nodes</div>
         <div class="menu_button" id="rpg_clear">Clear graph</div>
       </div>
       <div class="rpg-status" id="rpg_status"></div>
@@ -626,6 +675,7 @@ function mountUI() {
     saveSettings();
   });
   $('#rpg_rebuild').on('click', () => summarize(true));
+  $('#rpg_reembed').on('click', reembedAll);
   $('#rpg_view').on('click', openGraphViewer);
   $('#rpg_clear').on('click', () => {
     if (!confirm('Delete the whole memory graph for this chat?')) return;
@@ -637,7 +687,7 @@ function mountUI() {
 jQuery(() => {
   const ctx = ctxNow();
   // lets other extensions (e.g. Code Window) open the graph without going through the settings panel
-  window.rpMemoryGraph = { open: openGraphViewer, version: '0.1.1' };
+  window.rpMemoryGraph = { open: openGraphViewer, version: '0.1.2' };
   mountUI();
   refreshUI();
   ctx.eventSource.on(ctx.eventTypes.CHAT_CHANGED, refreshUI);
