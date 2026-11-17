@@ -109,6 +109,23 @@ async function embed(texts) {
 // Vectors only live in memory (nothing is saved in the chat), so this also pre-warms the cache: the first reply
 // after a restart or a model change then only has to embed the query instead of every node.
 let reembedding = false;
+let progressToast = null;
+function showProgress(done, total, label) {
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const text = `${label} ${done}/${total} (${pct}%)`;
+  $('#rpg_progress').show();
+  $('#rpg_progress_bar').css('width', `${pct}%`);
+  $('#rpg_progress_text').text(text);
+  $('#rpg_reembed').text(`Re-embedding ${pct}%`);
+  if (progressToast) $(progressToast).find('.toast-message').text(text);
+  setStatus(text);
+}
+function hideProgress() {
+  $('#rpg_progress').hide();
+  $('#rpg_progress_bar').css('width', '0%');
+  $('#rpg_reembed').text('Re-embed all nodes');
+  if (progressToast) { toastr.clear(progressToast); progressToast = null; }
+}
 async function reembedAll() {
   if (busy) return toastr.info('Memory graph is busy summarizing.', 'RP Memory Graph');
   if (reembedding) return toastr.info('Already re-embedding.', 'RP Memory Graph');
@@ -119,18 +136,20 @@ async function reembedAll() {
   reembedding = true;
   $('#rpg_reembed').addClass('disabled');
   const t0 = Date.now();
-  const BATCH = 16;
+  const BATCH = 8;
   const texts = g.nodes.map(nodeText);
   let done = 0;
   let dims = 0;
   try {
     vecCache.clear();
+    progressToast = toastr.info('Starting…', 'RP Memory Graph: re-embedding', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, closeButton: true });
+    showProgress(0, texts.length, 'Loading model…');
     for (let i = 0; i < texts.length; i += BATCH) {
       const part = texts.slice(i, i + BATCH);
       const vecs = await embed(part);
       if (!dims && vecs[0]) dims = vecs[0].length;
       done += part.length;
-      setStatus(`Re-embedding with ${s.embedModel}: ${done}/${texts.length} nodes…`);
+      showProgress(done, texts.length, `Re-embedding with ${s.embedModel}:`);
     }
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     toastr.success(`Re-embedded ${done} node${done === 1 ? '' : 's'} with ${s.embedModel} (${dims} dimensions, ${secs}s).`, 'RP Memory Graph');
@@ -141,6 +160,7 @@ async function reembedAll() {
     toastr.error(`Re-embedding failed after ${done}/${texts.length} nodes: ${String(e && e.message || e)}\nCheck the URL/model and that Ollama is running.`, 'RP Memory Graph', { timeOut: 12000 });
   } finally {
     reembedding = false;
+    hideProgress();
     $('#rpg_reembed').removeClass('disabled');
     refreshUI();
   }
@@ -628,6 +648,10 @@ function mountUI() {
         <div class="menu_button" id="rpg_rebuild">Rebuild from chat</div>
         <div class="menu_button" id="rpg_reembed">Re-embed all nodes</div>
         <div class="menu_button" id="rpg_clear">Clear graph</div>
+      </div>
+      <div id="rpg_progress" style="display:none;margin:6px 0">
+        <div style="height:10px;border-radius:5px;background:rgba(128,128,128,.3);overflow:hidden"><div id="rpg_progress_bar" style="height:100%;width:0%;background:#4a9eff;transition:width .2s"></div></div>
+        <div id="rpg_progress_text" style="font-size:.9em;margin-top:4px"></div>
       </div>
       <div class="rpg-status" id="rpg_status"></div>
       <label>Cache check (this request vs the previous one)</label>
